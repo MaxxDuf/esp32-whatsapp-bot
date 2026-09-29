@@ -1,4 +1,4 @@
-```python
+
 import os
 import io
 import asyncio
@@ -414,4 +414,4 @@ if __name__ == "__main__":
     client.run(
         DISCORD_TOKEN
     )
-```
+
