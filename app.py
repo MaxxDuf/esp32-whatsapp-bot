@@ -1,52 +1,52 @@
 import os
-from flask import Flask, request, jsonify
+import discord
+from discord import app_commands
 
-app = Flask(__name__)
+TOKEN = os.environ["DISCORD_TOKEN"]
 
-@app.route("/")
-def home():
-    return "🤖 Bot ESP32-CAM en ligne !"
+class CameraBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
-@app.route("/test")
-def test():
-    return jsonify({
-        "status": "ok",
-        "message": "Le serveur fonctionne !"
-    })
+    async def setup_hook(self):
+        await self.tree.sync()
 
-@app.route("/command", methods=["POST"])
-def command():
-    data = request.get_json(silent=True) or {}
-    cmd = data.get("command", "")
-
-    if cmd == "/photo":
-        return jsonify({
-            "status": "ok",
-            "action": "photo",
-            "message": "Commande photo reçue 📷"
-        })
-
-    if cmd == "/10":
-        return jsonify({
-            "status": "ok",
-            "action": "video",
-            "duration": 10,
-            "message": "Commande vidéo 10 secondes reçue 🎥"
-        })
-
-    if cmd == "/direct":
-        return jsonify({
-            "status": "ok",
-            "action": "live",
-            "message": "Commande direct reçue 📹"
-        })
-
-    return jsonify({
-        "status": "error",
-        "message": "Commande inconnue"
-    }), 400
+client = CameraBot()
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+@client.event
+async def on_ready():
+    print(f"Connecté en tant que {client.user}")
+
+
+@client.tree.command(name="photo", description="Prend une photo avec l'ESP32-CAM")
+async def photo(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "📷 Commande reçue ! La caméra sera connectée prochainement."
+    )
+
+
+@client.tree.command(name="10", description="Récupère les 10 dernières secondes")
+async def video_10(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "🎥 Commande reçue ! Le système vidéo sera connecté prochainement."
+    )
+
+
+@client.tree.command(name="direct", description="Démarre le direct de la caméra")
+async def direct(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "📹 Direct demandé !"
+    )
+
+
+@client.tree.command(name="stop", description="Arrête le direct")
+async def stop(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "⏹️ Direct arrêté."
+    )
+
+
+client.run(TOKEN)
