@@ -316,7 +316,7 @@ def receive_video():
 
 
         # 5 FPS
-        fps = 5.0
+        fps = 1.6
 
 
         fourcc = cv2.VideoWriter_fourcc(
