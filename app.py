@@ -19,23 +19,17 @@ from flask import Flask, request, jsonify
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 CAMERA_SECRET = os.environ.get("CAMERA_SECRET", "")
-
 PORT = int(os.environ.get("PORT", 10000))
 
 if not CAMERA_SECRET:
-    raise RuntimeError("La variable CAMERA_SECRET est absente sur Render.")
+    raise RuntimeError("CAMERA_SECRET est absent sur Render.")
 
 
 # ============================================================
-# FLASK
+# FLASK ET VARIABLES
 # ============================================================
 
 web_app = Flask(__name__)
-
-
-# ============================================================
-# VARIABLES
-# ============================================================
 
 camera_lock = Lock()
 
@@ -44,11 +38,10 @@ capture_timer = None
 
 
 # ============================================================
-# AUTHENTIFICATION CAMERA
+# AUTHENTIFICATION
 # ============================================================
 
 def camera_authorized():
-
     secret = request.headers.get("X-Camera-Secret", "")
 
     return hmac.compare_digest(
@@ -58,42 +51,93 @@ def camera_authorized():
 
 
 # ============================================================
-# NOTIFICATION DISCORD
+# ENVOI DE MESSAGES DISCORD
 # ============================================================
 
-async def envoyer_message_erreur(channel_id, message):
+async def envoyer_message(channel_id, message):
 
     channel = client.get_channel(channel_id)
 
     if channel is None:
         channel = await client.fetch_channel(channel_id)
 
-    await channel.send(
-        f"⚠️ **PROBLEME AVEC LA CAMERA**\n\n{message}"
-    )
+    await channel.send(message)
 
 
-def envoyer_erreur_discord(channel_id, message):
+def envoyer_message_sync(channel_id, message):
 
     if channel_id is None:
         return
 
     try:
-
         future = asyncio.run_coroutine_threadsafe(
-            envoyer_message_erreur(channel_id, message),
+            envoyer_message(channel_id, message),
             client.loop
         )
 
-        future.result(timeout=20)
+        future.result(timeout=25)
 
     except Exception as e:
+        print(f"Erreur envoi Discord : {e}")
 
-        print(f"Erreur notification Discord : {e}")
+
+def envoyer_erreur_discord(channel_id, message):
+
+    envoyer_message_sync(
+        channel_id,
+        "⚠️ **PROBLÈME AVEC LA CAMÉRA**\n\n" + message
+    )
 
 
 # ============================================================
-# FIN DE CAPTURE
+# JOURNAL ESP32
+# ============================================================
+
+@web_app.route("/api/log", methods=["POST"])
+def receive_log():
+
+    if not camera_authorized():
+        return jsonify({
+            "error": "unauthorized"
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    message = str(data.get("message", "")).strip()
+
+    if not message:
+        return jsonify({
+            "error": "empty log"
+        }), 400
+
+    with camera_lock:
+
+        capture = active_capture
+
+        if capture is None or capture["type"] != "photo":
+            return jsonify({
+                "error": "no active photo"
+            }), 409
+
+        channel_id = capture["channel_id"]
+
+    print("JOURNAL ESP32 :", message)
+
+    envoyer_message_sync(
+        channel_id,
+        "🖥️ **ESP32 — Journal de fonctionnement**\n"
+        "```text\n"
+        + message[:1800]
+        + "\n```"
+    )
+
+    return jsonify({
+        "success": True
+    })
+
+
+# ============================================================
+# GESTION DES CAPTURES
 # ============================================================
 
 def terminer_capture():
@@ -135,11 +179,17 @@ def terminer_capture_succes():
     capture = terminer_capture()
 
     if capture is not None:
-        print("Capture terminee avec succes.")
+        print("Capture terminée avec succès.")
+
+        envoyer_message_sync(
+            capture["channel_id"],
+            "✅ **Mission terminée !**\n"
+            "La photo a été reçue par Render et publiée sur Discord."
+        )
 
 
 # ============================================================
-# DELAI MAXIMAL DE CAPTURE
+# DELAI MAXIMAL
 # ============================================================
 
 def verifier_timeout(capture_id):
@@ -162,26 +212,12 @@ def verifier_timeout(capture_id):
 
     print("DELAI DE CAPTURE DEPASSE")
 
-    if capture["type"] == "photo":
-
-        message = (
-            "⏱️ **Delai depasse**\n"
-            "L'ESP32 n'a pas termine la prise ou l'envoi "
-            "de la photo dans le temps imparti.\n"
-            "Verifie sa connexion Wi-Fi et son fonctionnement."
-        )
-
-    else:
-
-        message = (
-            "⏱️ **Delai depasse**\n"
-            "L'ESP32 n'a pas termine l'enregistrement ou "
-            "l'envoi de la video dans le temps imparti."
-        )
-
     envoyer_erreur_discord(
         capture["channel_id"],
-        message
+        "⏱️ **Délai dépassé**\n"
+        "Le relais ESP32 n'a pas terminé la capture dans le temps prévu.\n"
+        "Cela peut venir d'une perte de Wi-Fi, d'une caméra inaccessible, "
+        "d'un blocage du relais ou d'un problème de transfert."
     )
 
 
@@ -235,7 +271,6 @@ def home():
     <head>
         <title>ESP32-CAM Bot</title>
     </head>
-
     <body style="
         background:#111;
         color:white;
@@ -243,16 +278,12 @@ def home():
         text-align:center;
         padding-top:60px;
     ">
-
         <h1>ESP32-CAM Bot</h1>
-
         <p style="color:#00ff88;font-size:22px;">
-            Bot operationnel
+            Bot opérationnel
         </p>
-
-        <p>Discord : connecte</p>
+        <p>Discord : connecté</p>
         <p>ESP32-CAM : relais WROOM</p>
-
     </body>
     </html>
     """
@@ -267,62 +298,43 @@ def get_command():
 
     if not camera_authorized():
 
-        print("ERREUR : identification ESP32 refusee")
+        print("ERREUR : identification ESP32 refusée")
 
         terminer_capture_avec_erreur(
-            "🔐 **Probleme d'identification**\n"
-            "Render a refuse la connexion de l'ESP32 (HTTP 401).\n"
-            "Le secret envoye par l'ESP32 ne correspond pas "
-            "a CAMERA_SECRET configure sur Render.\n"
-            "Verifie les deux valeurs."
+            "🔐 **Problème d'identification**\n"
+            "Render a refusé la connexion du relais (HTTP 401).\n"
+            "Le secret envoyé par l'ESP32 ne correspond pas à CAMERA_SECRET "
+            "configuré sur Render."
         )
 
         return jsonify({
-            "error": "unauthorized",
-            "message": "Camera authentication failed"
+            "error": "unauthorized"
         }), 401
 
     with camera_lock:
 
         if active_capture is None:
-
-            return jsonify({
-                "command": "none"
-            })
+            return jsonify({"command": "none"})
 
         if active_capture["delivered"]:
-
-            return jsonify({
-                "command": "none"
-            })
+            return jsonify({"command": "none"})
 
         active_capture["delivered"] = True
-
         capture_type = active_capture["type"]
 
     if capture_type == "photo":
-
-        print("Commande PHOTO envoyee")
-
-        return jsonify({
-            "command": "photo"
-        })
+        print("Commande PHOTO envoyée")
+        return jsonify({"command": "photo"})
 
     if capture_type == "video":
+        print("Commande VIDEO envoyée")
+        return jsonify({"command": "video10"})
 
-        print("Commande VIDEO envoyee")
-
-        return jsonify({
-            "command": "video10"
-        })
-
-    return jsonify({
-        "command": "none"
-    })
+    return jsonify({"command": "none"})
 
 
 # ============================================================
-# RECEPTION DES ERREURS DE L'ESP32
+# ERREURS SIGNALEES PAR LE RELAIS
 # ============================================================
 
 @web_app.route("/api/error", methods=["POST"])
@@ -331,8 +343,8 @@ def receive_error():
     if not camera_authorized():
 
         terminer_capture_avec_erreur(
-            "🔐 **Probleme d'identification**\n"
-            "L'ESP32 a ete refuse par Render (HTTP 401)."
+            "🔐 **Problème d'identification**\n"
+            "Le relais ESP32 a été refusé par Render (HTTP 401)."
         )
 
         return jsonify({
@@ -342,46 +354,45 @@ def receive_error():
     data = request.get_json(silent=True) or {}
 
     code = str(data.get("code", "unknown"))
-    detail = str(data.get("detail", "Aucun detail fourni"))
+    detail = str(data.get("detail", "Aucun détail fourni"))
 
     erreurs = {
-
         "camera_connection":
-            "📡 Impossible de se connecter au reseau Wi-Fi de la camera.",
+            "📡 Impossible de se connecter au Wi-Fi de la caméra.",
 
         "camera_capture":
-            "📷 La camera n'a pas reussi a prendre une photo.",
+            "📷 La caméra n'a pas réussi à prendre la photo.",
 
         "camera_http":
-            "🌐 La camera a renvoye une erreur HTTP.",
+            "🌐 La caméra a renvoyé une erreur HTTP.",
 
         "render_connection":
-            "🌐 Impossible de contacter le serveur Render.",
+            "🌐 Impossible de contacter Render.",
 
         "photo_download":
-            "📥 Impossible de telecharger la photo depuis la camera.",
+            "📥 Impossible de télécharger la photo depuis la caméra.",
 
         "photo_upload":
-            "📤 Impossible d'envoyer la photo vers Render.",
+            "📤 Impossible d'envoyer la photo à Render.",
 
         "memory":
-            "🧠 Memoire insuffisante sur l'ESP32.",
+            "🧠 Mémoire insuffisante sur l'ESP32.",
+
+        "home_wifi":
+            "🏠 Impossible de retrouver le Wi-Fi maison.",
 
         "unknown":
             "❓ Une erreur inconnue s'est produite."
     }
 
-    description = erreurs.get(
-        code,
-        erreurs["unknown"]
-    )
+    description = erreurs.get(code, erreurs["unknown"])
 
     print(f"ERREUR ESP32 : {code} - {detail}")
 
     terminer_capture_avec_erreur(
         f"{description}\n\n"
         f"**Code :** `{code}`\n"
-        f"**Detail technique :** `{detail[:500]}`"
+        f"**Détail technique :** `{detail[:500]}`"
     )
 
     return jsonify({
@@ -399,9 +410,8 @@ def receive_photo():
     if not camera_authorized():
 
         terminer_capture_avec_erreur(
-            "🔐 **Probleme d'identification**\n"
-            "Render a refuse l'envoi de la photo (HTTP 401).\n"
-            "Verifie CAMERA_SECRET sur Render et dans l'ESP32."
+            "🔐 **Problème d'identification**\n"
+            "Render a refusé l'envoi de la photo (HTTP 401)."
         )
 
         return jsonify({
@@ -414,7 +424,7 @@ def receive_photo():
 
         terminer_capture_avec_erreur(
             "📷 **Photo vide**\n"
-            "L'ESP32 a contacte Render, mais aucune image n'a ete recue."
+            "Render n'a reçu aucune donnée image."
         )
 
         return jsonify({
@@ -426,7 +436,6 @@ def receive_photo():
         capture = active_capture
 
         if capture is None or capture["type"] != "photo":
-
             return jsonify({
                 "error": "no active photo request"
             }), 409
@@ -460,10 +469,9 @@ def receive_photo():
         print("ERREUR ENVOI PHOTO :", e)
 
         terminer_capture_avec_erreur(
-            "📤 **Echec de l'envoi Discord**\n"
-            "La photo a ete recue par Render, mais Discord "
-            "n'a pas reussi a la publier.\n\n"
-            f"**Detail :** `{str(e)[:500]}`"
+            "📤 **Échec de l'envoi Discord**\n"
+            "Render a reçu la photo, mais Discord n'a pas réussi à la publier.\n\n"
+            f"**Détail technique :** `{str(e)[:500]}`"
         )
 
         return jsonify({
@@ -481,8 +489,8 @@ def receive_video():
     if not camera_authorized():
 
         terminer_capture_avec_erreur(
-            "🔐 **Probleme d'identification**\n"
-            "Render a refuse l'envoi de la video (HTTP 401)."
+            "🔐 **Problème d'identification**\n"
+            "Render a refusé l'envoi de la vidéo (HTTP 401)."
         )
 
         return jsonify({
@@ -494,8 +502,8 @@ def receive_video():
     if not video_data:
 
         terminer_capture_avec_erreur(
-            "🎥 **Video vide**\n"
-            "Aucune donnee video n'a ete recue."
+            "🎥 **Vidéo vide**\n"
+            "Aucune donnée vidéo n'a été reçue."
         )
 
         return jsonify({
@@ -507,23 +515,16 @@ def receive_video():
         capture = active_capture
 
         if capture is None or capture["type"] != "video":
-
             return jsonify({
                 "error": "no active video request"
             }), 409
 
         channel_id = capture["channel_id"]
 
-    print(f"VIDEO RECUE : {len(video_data)} octets")
-
     mjpeg_path = None
     mp4_path = None
 
     try:
-
-        # ----------------------------------------------------
-        # FICHIER MJPEG TEMPORAIRE
-        # ----------------------------------------------------
 
         with tempfile.NamedTemporaryFile(
             suffix=".mjpeg",
@@ -533,30 +534,15 @@ def receive_video():
             mjpeg_path = f.name
             f.write(video_data)
 
-        # ----------------------------------------------------
-        # CONVERSION MJPEG -> MP4
-        # ----------------------------------------------------
-
-        mp4_path = mjpeg_path.replace(
-            ".mjpeg",
-            ".mp4"
-        )
+        mp4_path = mjpeg_path.replace(".mjpeg", ".mp4")
 
         cap = cv2.VideoCapture(mjpeg_path)
 
         if not cap.isOpened():
+            raise Exception("Impossible de lire le fichier MJPEG.")
 
-            raise Exception(
-                "Impossible de lire le fichier MJPEG."
-            )
-
-        width = int(
-            cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        )
-
-        height = int(
-            cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        )
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         if width <= 0:
             width = 640
@@ -564,24 +550,16 @@ def receive_video():
         if height <= 0:
             height = 480
 
-        fps = 1.6
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
         writer = cv2.VideoWriter(
             mp4_path,
-            fourcc,
-            fps,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            1.6,
             (width, height)
         )
 
         if not writer.isOpened():
-
             cap.release()
-
-            raise Exception(
-                "Impossible de creer le fichier MP4."
-            )
+            raise Exception("Impossible de créer le fichier MP4.")
 
         frames = 0
 
@@ -598,31 +576,17 @@ def receive_video():
         cap.release()
         writer.release()
 
-        print(f"CONVERSION VIDEO : {frames} images")
-
         if frames == 0:
-
-            raise Exception(
-                "Aucune image exploitable dans la video."
-            )
-
-        # ----------------------------------------------------
-        # ENVOI DISCORD
-        # ----------------------------------------------------
+            raise Exception("Aucune image exploitable dans la vidéo.")
 
         future = asyncio.run_coroutine_threadsafe(
-            send_video_to_discord(
-                channel_id,
-                mp4_path
-            ),
+            send_video_to_discord(channel_id, mp4_path),
             client.loop
         )
 
         future.result(timeout=120)
 
         terminer_capture_succes()
-
-        print("VIDEO ENVOYEE SUR DISCORD")
 
         return jsonify({
             "success": True,
@@ -631,12 +595,9 @@ def receive_video():
 
     except Exception as e:
 
-        print("ERREUR VIDEO :", e)
-
         terminer_capture_avec_erreur(
-            "🎥 **Echec du traitement video**\n"
-            "Render n'a pas reussi a convertir ou envoyer la video.\n\n"
-            f"**Detail :** `{str(e)[:500]}`"
+            "🎥 **Échec du traitement vidéo**\n"
+            f"**Détail :** `{str(e)[:500]}`"
         )
 
         return jsonify({
@@ -645,19 +606,13 @@ def receive_video():
 
     finally:
 
-        if mjpeg_path:
+        for path in (mjpeg_path, mp4_path):
 
-            try:
-                os.remove(mjpeg_path)
-            except OSError:
-                pass
-
-        if mp4_path:
-
-            try:
-                os.remove(mp4_path)
-            except OSError:
-                pass
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
 # ============================================================
@@ -668,36 +623,26 @@ class CameraBot(discord.Client):
 
     def __init__(self):
 
-        intents = discord.Intents.default()
-
         super().__init__(
-            intents=intents
+            intents=discord.Intents.default()
         )
 
-        self.tree = app_commands.CommandTree(
-            self
-        )
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
 
         await self.tree.sync()
 
-        print("Commandes Discord synchronisees")
+        print("Commandes Discord synchronisées")
 
 
 client = CameraBot()
 
 
-# ============================================================
-# READY
-# ============================================================
-
 @client.event
 async def on_ready():
 
-    print(
-        f"Connecte en tant que {client.user}"
-    )
+    print(f"Connecté en tant que {client.user}")
 
 
 # ============================================================
@@ -718,19 +663,18 @@ async def photo(interaction: discord.Interaction):
     if not success:
 
         await interaction.response.send_message(
-            "⏳ Une capture est deja en cours."
+            "⏳ Une capture est déjà en cours."
         )
 
         return
 
     await interaction.response.send_message(
-        "📷 Demande de photo envoyee.\n"
-        "J'attends la reponse de la camera..."
+        "📷 Demande de photo envoyée.\n"
+        "Je vais afficher les étapes du relais au fur et à mesure "
+        "qu'il retrouve Internet."
     )
 
-    print(
-        f"PHOTO DEMANDEE dans le salon {interaction.channel_id}"
-    )
+    print(f"PHOTO DEMANDEE : salon {interaction.channel_id}")
 
 
 # ============================================================
@@ -739,7 +683,7 @@ async def photo(interaction: discord.Interaction):
 
 @client.tree.command(
     name="10s",
-    description="Enregistre 10 secondes de video"
+    description="Enregistre 10 secondes de vidéo"
 )
 async def video10(interaction: discord.Interaction):
 
@@ -751,18 +695,13 @@ async def video10(interaction: discord.Interaction):
     if not success:
 
         await interaction.response.send_message(
-            "⏳ Une capture est deja en cours."
+            "⏳ Une capture est déjà en cours."
         )
 
         return
 
     await interaction.response.send_message(
-        "🎥 Enregistrement de 10 secondes demande.\n"
-        "J'attends la reponse de la camera..."
-    )
-
-    print(
-        f"VIDEO DEMANDEE dans le salon {interaction.channel_id}"
+        "🎥 Enregistrement de 10 secondes demandé."
     )
 
 
@@ -777,7 +716,7 @@ async def video10(interaction: discord.Interaction):
 async def direct(interaction: discord.Interaction):
 
     await interaction.response.send_message(
-        "📹 Le direct continu n'est pas encore active.\n"
+        "📹 Le direct continu n'est pas encore activé. "
         "Utilise /10s pour enregistrer 10 secondes."
     )
 
@@ -788,7 +727,7 @@ async def direct(interaction: discord.Interaction):
 
 @client.tree.command(
     name="stop",
-    description="Arrete le direct"
+    description="Arrête le direct"
 )
 async def stop(interaction: discord.Interaction):
 
@@ -801,18 +740,12 @@ async def stop(interaction: discord.Interaction):
 # ENVOI PHOTO DISCORD
 # ============================================================
 
-async def send_photo_to_discord(
-    channel_id,
-    image_data
-):
+async def send_photo_to_discord(channel_id, image_data):
 
     channel = client.get_channel(channel_id)
 
     if channel is None:
-
-        channel = await client.fetch_channel(
-            channel_id
-        )
+        channel = await client.fetch_channel(channel_id)
 
     image_file = discord.File(
         io.BytesIO(image_data),
@@ -829,18 +762,12 @@ async def send_photo_to_discord(
 # ENVOI VIDEO DISCORD
 # ============================================================
 
-async def send_video_to_discord(
-    channel_id,
-    video_path
-):
+async def send_video_to_discord(channel_id, video_path):
 
     channel = client.get_channel(channel_id)
 
     if channel is None:
-
-        channel = await client.fetch_channel(
-            channel_id
-        )
+        channel = await client.fetch_channel(channel_id)
 
     video_file = discord.File(
         video_path,
@@ -848,7 +775,7 @@ async def send_video_to_discord(
     )
 
     await channel.send(
-        content="🎬 Video de 10 secondes",
+        content="🎬 Vidéo de 10 secondes",
         file=video_file
     )
 
@@ -879,6 +806,4 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    client.run(
-        DISCORD_TOKEN
-    )
+    client.run(DISCORD_TOKEN)
