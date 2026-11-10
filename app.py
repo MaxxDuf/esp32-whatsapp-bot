@@ -40,7 +40,6 @@ camera_lock = Lock()
 active_capture = None
 capture_timer = None
 
-# Mode photos automatiques
 continuous_session = {
     "running": False,
     "channel_id": None,
@@ -79,7 +78,7 @@ def envoyer_message_sync(channel_id, message):
             envoyer_message(channel_id, message),
             client.loop
         )
-        future.result(timeout=25)
+        future.result(timeout=30)
         return True
 
     except Exception as e:
@@ -137,36 +136,72 @@ def creer_capture(capture_type, channel_id):
     return True
 
 
-def terminer_capture():
+def terminer_capture_succes(capture_id):
     global active_capture, capture_timer
 
     with camera_lock:
+        if active_capture is None:
+            return False
+
+        if active_capture["id"] != capture_id:
+            return False
+
         capture = active_capture
         timer = capture_timer
 
         active_capture = None
         capture_timer = None
 
+        continuer = (
+            continuous_session["running"]
+            and continuous_session["channel_id"] == capture["channel_id"]
+            and capture["type"] == "photo"
+        )
+
+        if continuer:
+            continuous_session["next_photo_at"] = (
+                time.monotonic() + INTERVALLE_PHOTOS
+            )
+
     if timer is not None:
         timer.cancel()
 
-    return capture
+    print("CAPTURE TERMINEE AVEC SUCCES")
+
+    if capture["type"] == "photo":
+        if continuer:
+            print("Prochaine photo dans 10 secondes.")
+        else:
+            envoyer_message_sync(
+                capture["channel_id"],
+                "✅ **Photo reçue et publiée avec succès !**"
+            )
+
+    return True
 
 
-def arreter_mode_continu():
+def terminer_capture_avec_erreur(message, capture_id=None):
+    global active_capture, capture_timer
+
     with camera_lock:
-        continuous_session["running"] = False
-        continuous_session["next_photo_at"] = 0.0
+        if active_capture is None:
+            return False
 
+        if capture_id is not None and active_capture["id"] != capture_id:
+            return False
 
-def terminer_capture_avec_erreur(message):
-    capture = terminer_capture()
+        capture = active_capture
+        timer = capture_timer
 
-    if capture is None:
-        return
+        active_capture = None
+        capture_timer = None
 
-    # Une erreur arrête le mode automatique.
-    arreter_mode_continu()
+        if continuous_session["channel_id"] == capture["channel_id"]:
+            continuous_session["running"] = False
+            continuous_session["next_photo_at"] = 0.0
+
+    if timer is not None:
+        timer.cancel()
 
     print("ERREUR CAPTURE :", message)
 
@@ -175,43 +210,7 @@ def terminer_capture_avec_erreur(message):
         message
     )
 
-
-def terminer_capture_succes():
-    capture = terminer_capture()
-
-    if capture is None:
-        return
-
-    channel_id = capture["channel_id"]
-
-    envoyer_message_sync(
-        channel_id,
-        "✅ **Photo reçue et publiée avec succès !**"
-    )
-
-    # Programmer la prochaine photo uniquement si /start
-    # est toujours actif.
-    with camera_lock:
-        continuer = (
-            continuous_session["running"]
-            and continuous_session["channel_id"] == channel_id
-        )
-
-        if continuer:
-            continuous_session["next_photo_at"] = (
-                time.monotonic() + INTERVALLE_PHOTOS
-            )
-
-    if continuer:
-        envoyer_message_sync(
-            channel_id,
-            "⏳ Prochaine photo dans 10 secondes."
-        )
-    else:
-        envoyer_message_sync(
-            channel_id,
-            "🛑 Cycle terminé. Aucune nouvelle photo ne sera lancée."
-        )
+    return True
 
 
 # ============================================================
@@ -233,8 +232,9 @@ def verifier_timeout(capture_id):
         active_capture = None
         capture_timer = None
 
-        continuous_session["running"] = False
-        continuous_session["next_photo_at"] = 0.0
+        if continuous_session["channel_id"] == capture["channel_id"]:
+            continuous_session["running"] = False
+            continuous_session["next_photo_at"] = 0.0
 
     print("DELAI DE CAPTURE DEPASSE")
 
@@ -294,8 +294,10 @@ def receive_log():
 def home():
     with camera_lock:
         mode = continuous_session["running"]
+        capture = active_capture is not None
 
     etat = "Photos automatiques actives" if mode else "En attente"
+    capture_etat = "Capture en cours" if capture else "Aucune capture"
 
     return f"""
     <!DOCTYPE html>
@@ -308,6 +310,7 @@ def home():
         <p>Discord : connecté</p>
         <p>ESP32-CAM : relais WROOM</p>
         <p>Mode : {etat}</p>
+        <p>Capture : {capture_etat}</p>
     </body>
     </html>
     """
@@ -321,30 +324,46 @@ def home():
 def get_command():
     if not camera_authorized():
         print("ERREUR : identification ESP32 refusée")
-
-        terminer_capture_avec_erreur(
-            "🔐 **Problème d'identification**\n"
-            "Render a refusé la connexion du relais (HTTP 401).\n"
-            "Le secret du WROOM ne correspond pas à CAMERA_SECRET sur Render."
-        )
-
         return jsonify({"error": "unauthorized"}), 401
 
     with camera_lock:
-        # Une capture est déjà en cours : ne rien redonner.
+
+        # Une capture existe déjà.
         if active_capture is not None:
+
+            # Commande manuelle pas encore transmise au WROOM.
+            if not active_capture["delivered"]:
+                active_capture["delivered"] = True
+
+                capture_type = active_capture["type"]
+
+                if capture_type == "photo":
+                    print("COMMANDE PHOTO MANUELLE ENVOYEE")
+                    return jsonify({"command": "photo"})
+
+                if capture_type == "video":
+                    print("COMMANDE VIDEO ENVOYEE")
+                    return jsonify({"command": "video10"})
+
             return jsonify({"command": "none"})
 
-        # Mode automatique : créer une capture quand le délai est écoulé.
+        # Mode automatique.
         if continuous_session["running"]:
+
             if time.monotonic() < continuous_session["next_photo_at"]:
                 return jsonify({"command": "none"})
 
             channel_id = continuous_session["channel_id"]
-            capture = creer_capture_sous_verrou("photo", channel_id)
+
+            capture = creer_capture_sous_verrou(
+                "photo",
+                channel_id
+            )
+
             capture["delivered"] = True
 
             print("PHOTO AUTOMATIQUE ENVOYEE AU WROOM")
+
             return jsonify({"command": "photo"})
 
         return jsonify({"command": "none"})
@@ -357,10 +376,6 @@ def get_command():
 @web_app.route("/api/error", methods=["POST"])
 def receive_error():
     if not camera_authorized():
-        terminer_capture_avec_erreur(
-            "🔐 **Problème d'identification**\n"
-            "Le relais ESP32 a été refusé par Render (HTTP 401)."
-        )
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
@@ -384,11 +399,24 @@ def receive_error():
 
     print(f"ERREUR ESP32 : {code} - {detail}")
 
-    terminer_capture_avec_erreur(
+    message = (
         f"{description}\n\n"
         f"**Code :** `{code}`\n"
         f"**Détail technique :** `{detail[:500]}`"
     )
+
+    with camera_lock:
+        capture = active_capture
+        channel_id = (
+            capture["channel_id"]
+            if capture is not None
+            else continuous_session["channel_id"]
+        )
+
+    if capture is not None:
+        terminer_capture_avec_erreur(message, capture["id"])
+    elif channel_id is not None:
+        envoyer_erreur_discord(channel_id, message)
 
     return jsonify({"success": True})
 
@@ -400,10 +428,6 @@ def receive_error():
 @web_app.route("/api/photo", methods=["POST"])
 def receive_photo():
     if not camera_authorized():
-        terminer_capture_avec_erreur(
-            "🔐 **Problème d'identification**\n"
-            "Render a refusé l'envoi de la photo (HTTP 401)."
-        )
         return jsonify({"error": "unauthorized"}), 401
 
     image_data = request.get_data()
@@ -421,6 +445,7 @@ def receive_photo():
             return jsonify({"error": "no active photo request"}), 409
 
         channel_id = capture["channel_id"]
+        capture_id = capture["id"]
 
     print(f"PHOTO RECUE : {len(image_data)} octets")
 
@@ -433,7 +458,9 @@ def receive_photo():
         future.result(timeout=45)
 
         print("PHOTO ENVOYEE SUR DISCORD")
-        terminer_capture_succes()
+
+        if not terminer_capture_succes(capture_id):
+            return jsonify({"error": "capture expired"}), 409
 
         return jsonify({"success": True})
 
@@ -443,7 +470,8 @@ def receive_photo():
         terminer_capture_avec_erreur(
             "📤 **Échec de l'envoi Discord**\n"
             "Render a reçu la photo, mais Discord n'a pas réussi à la publier.\n\n"
-            f"**Détail technique :** `{str(e)[:500]}`"
+            f"**Détail technique :** `{str(e)[:500]}`",
+            capture_id
         )
 
         return jsonify({"error": str(e)}), 500
@@ -456,15 +484,14 @@ def receive_photo():
 @web_app.route("/api/video", methods=["POST"])
 def receive_video():
     if not camera_authorized():
-        terminer_capture_avec_erreur(
-            "🔐 Render a refusé l'envoi de la vidéo (HTTP 401)."
-        )
         return jsonify({"error": "unauthorized"}), 401
 
     video_data = request.get_data()
 
     if not video_data:
-        terminer_capture_avec_erreur("🎥 Aucune donnée vidéo reçue.")
+        terminer_capture_avec_erreur(
+            "🎥 Aucune donnée vidéo reçue."
+        )
         return jsonify({"error": "empty video"}), 400
 
     with camera_lock:
@@ -474,6 +501,7 @@ def receive_video():
             return jsonify({"error": "no active video request"}), 409
 
         channel_id = capture["channel_id"]
+        capture_id = capture["id"]
 
     mjpeg_path = None
     mp4_path = None
@@ -511,8 +539,10 @@ def receive_video():
 
         while True:
             ok, frame = cap.read()
+
             if not ok:
                 break
+
             writer.write(frame)
             frames += 1
 
@@ -526,17 +556,21 @@ def receive_video():
             send_video_to_discord(channel_id, mp4_path),
             client.loop
         )
+
         future.result(timeout=120)
 
-        terminer_capture_succes()
+        if not terminer_capture_succes(capture_id):
+            return jsonify({"error": "capture expired"}), 409
 
         return jsonify({"success": True, "frames": frames})
 
     except Exception as e:
         terminer_capture_avec_erreur(
             "🎥 **Échec du traitement vidéo**\n"
-            f"**Détail :** `{str(e)[:500]}`"
+            f"**Détail :** `{str(e)[:500]}`",
+            capture_id
         )
+
         return jsonify({"error": str(e)}), 500
 
     finally:
@@ -603,28 +637,31 @@ async def photo(interaction: discord.Interaction):
     description="Démarre les photos automatiques toutes les 10 secondes"
 )
 async def start(interaction: discord.Interaction):
-    global continuous_session
 
     with camera_lock:
-        if continuous_session["running"]:
-            await interaction.response.send_message(
-                "📸 Le mode photos automatiques est déjà actif."
-            )
-            return
+        deja_actif = continuous_session["running"]
+        capture_en_cours = active_capture is not None
 
-        if active_capture is not None:
-            await interaction.response.send_message(
-                "⏳ Une capture est déjà en cours. Réessaie après sa fin."
-            )
-            return
+        if not deja_actif and not capture_en_cours:
+            continuous_session["running"] = True
+            continuous_session["channel_id"] = interaction.channel_id
+            continuous_session["next_photo_at"] = time.monotonic()
 
-        continuous_session["running"] = True
-        continuous_session["channel_id"] = interaction.channel_id
-        continuous_session["next_photo_at"] = time.monotonic()
+    if deja_actif:
+        await interaction.response.send_message(
+            "📸 Le mode photos automatiques est déjà actif."
+        )
+        return
+
+    if capture_en_cours:
+        await interaction.response.send_message(
+            "⏳ Une capture est déjà en cours. Réessaie après sa fin."
+        )
+        return
 
     await interaction.response.send_message(
         "📸 **Mode photos automatiques activé !**\n"
-        "La première photo va être prise dès que le relais la reçoit.\n"
+        "La première photo sera prise dès que le relais la reçoit.\n"
         "Ensuite, une nouvelle photo sera envoyée 10 secondes après "
         "la fin de l'envoi précédent.\n"
         "Utilise `/stop` pour arrêter."
@@ -642,9 +679,14 @@ async def start(interaction: discord.Interaction):
     description="Arrête les photos automatiques"
 )
 async def stop(interaction: discord.Interaction):
+
     with camera_lock:
         actif = continuous_session["running"]
-        capture_en_cours = active_capture is not None
+        capture_en_cours = (
+            active_capture is not None
+            and active_capture["type"] == "photo"
+            and active_capture["channel_id"] == continuous_session["channel_id"]
+        )
 
         continuous_session["running"] = False
         continuous_session["next_photo_at"] = 0.0
@@ -702,7 +744,7 @@ async def video10(interaction: discord.Interaction):
 async def direct(interaction: discord.Interaction):
     await interaction.response.send_message(
         "📹 Le direct continu n'est pas encore activé. "
-        "Utilise /10s pour enregistrer 10 secondes ou /start "
+        "Utilise /10s pour demander une vidéo ou /start "
         "pour les photos automatiques."
     )
 
