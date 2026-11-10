@@ -29,9 +29,6 @@ INTERVALLE_PHOTOS = 10
 TIMEOUT_PHOTO = 180
 TIMEOUT_VIDEO = 240
 
-# Journal Discord active au demarrage
-rapports_actifs = True
-
 
 # ============================================================
 # FLASK ET VARIABLES
@@ -265,15 +262,7 @@ def receive_log():
     if not message:
         return jsonify({"error": "empty log"}), 400
 
-    # Verifier si les rapports sont actives.
     with camera_lock:
-        if not rapports_actifs:
-            print("JOURNAL IGNORE : rapports desactives.")
-            return jsonify({
-                "success": True,
-                "disabled": True
-            }), 200
-
         capture = active_capture
 
         if capture is None or capture["type"] != "photo":
@@ -294,7 +283,7 @@ def receive_log():
     if not succes:
         return jsonify({"error": "discord send failed"}), 500
 
-    return jsonify({"success": True}), 200
+    return jsonify({"success": True})
 
 
 # ============================================================
@@ -306,11 +295,9 @@ def home():
     with camera_lock:
         mode = continuous_session["running"]
         capture = active_capture is not None
-        rapports = rapports_actifs
 
     etat = "Photos automatiques actives" if mode else "En attente"
     capture_etat = "Capture en cours" if capture else "Aucune capture"
-    journal_etat = "Active" if rapports else "Desactive"
 
     return f"""
     <!DOCTYPE html>
@@ -324,7 +311,6 @@ def home():
         <p>ESP32-CAM : relais WROOM</p>
         <p>Mode : {etat}</p>
         <p>Capture : {capture_etat}</p>
-        <p>Journal Discord : {journal_etat}</p>
     </body>
     </html>
     """
@@ -342,8 +328,10 @@ def get_command():
 
     with camera_lock:
 
+        # Une capture existe déjà.
         if active_capture is not None:
 
+            # Commande manuelle pas encore transmise au WROOM.
             if not active_capture["delivered"]:
                 active_capture["delivered"] = True
 
@@ -359,6 +347,7 @@ def get_command():
 
             return jsonify({"command": "none"})
 
+        # Mode automatique.
         if continuous_session["running"]:
 
             if time.monotonic() < continuous_session["next_photo_at"]:
@@ -720,68 +709,6 @@ async def stop(interaction: discord.Interaction):
         )
 
     print("MODE AUTOMATIQUE ARRETE")
-
-
-# ============================================================
-# /DISABLE_REPORT
-# ============================================================
-
-@client.tree.command(
-    name="disable_report",
-    description="Désactive les journaux de fonctionnement sur Discord"
-)
-async def disable_report(interaction: discord.Interaction):
-    global rapports_actifs
-
-    with camera_lock:
-        deja_desactive = not rapports_actifs
-        rapports_actifs = False
-
-    if deja_desactive:
-        await interaction.response.send_message(
-            "ℹ️ Les journaux de fonctionnement sont déjà désactivés."
-        )
-        return
-
-    await interaction.response.send_message(
-        "🔕 **Journaux désactivés !**\n"
-        "Les informations techniques de l'ESP32 ne seront plus envoyées "
-        "sur Discord.\n"
-        "Les photos et les notifications d'erreur continueront normalement.\n"
-        "Utilise `/enable_report` pour les réactiver."
-    )
-
-    print("JOURNAUX DISCORD DESACTIVES")
-
-
-# ============================================================
-# /ENABLE_REPORT
-# ============================================================
-
-@client.tree.command(
-    name="enable_report",
-    description="Réactive les journaux de fonctionnement sur Discord"
-)
-async def enable_report(interaction: discord.Interaction):
-    global rapports_actifs
-
-    with camera_lock:
-        deja_actif = rapports_actifs
-        rapports_actifs = True
-
-    if deja_actif:
-        await interaction.response.send_message(
-            "ℹ️ Les journaux de fonctionnement sont déjà activés."
-        )
-        return
-
-    await interaction.response.send_message(
-        "🔔 **Journaux réactivés !**\n"
-        "Les informations techniques de l'ESP32 seront de nouveau "
-        "envoyées sur Discord lors des prochaines captures."
-    )
-
-    print("JOURNAUX DISCORD ACTIVES")
 
 
 # ============================================================
